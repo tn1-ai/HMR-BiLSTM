@@ -1,0 +1,16 @@
+% Requires \usepackage{booktabs} in LaTeX preamble
+\begin{table}[h]
+\centering
+\caption{Ablation Study --- MIT-BIH ECG Test Set}
+\label{tab:ablation}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Variant & Params & Acc & F1-macro & F1-S & F1-V & F1-F & AUC & Best Ep \\
+\midrule
+\textbf{HMR-BiLSTM (full)} & \textbf{505,038} & \textbf{0.9759} & \textbf{0.8921} & \textbf{0.7387} & \textbf{0.9492} & \textbf{0.7944} & \textbf{0.9917} & \textbf{32} \\
+No-RMC (c_t = c_lstm) & 505,038 & 0.9779 & 0.8918 & 0.7590 & 0.9505 & 0.7713 & 0.9911 & 20 \\
+No-CNN (raw input) & 450,062 & 0.9658 & 0.8470 & 0.6844 & 0.9329 & 0.6667 & 0.9881 & 18 \\
+Mean-Pool (no attention) & 486,413 & 0.9653 & 0.8506 & 0.6427 & 0.9261 & 0.7216 & 0.9865 & 10 \\
+\bottomrule
+\end{tabular}
+\end{table}

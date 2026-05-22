@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 # Custom imports
 from rlstm_model import RLSTMClassifier
 from report_results import load_rlstm_model, collect_predictions_and_gates
+from evaluate_fgsm import load_baseline_model
 from run_baselines import flatten_sequences, LSTMBaseline, NUM_CLASSES
 
 def evaluate_sklearn_model_noise(model, X_test, y_test, noise_levels):
@@ -58,69 +59,15 @@ def evaluate_torch_model_noise(model, X_test, y_test, device, noise_levels, is_r
         f1_scores.append(f1)
     return f1_scores
 
-def train_lstm(name, X_tr, y_tr, X_va, y_va, bidirectional, device, cw):
-    print(f"\n[Training {name} for robustness eval]")
-    input_size = X_tr.shape[-1]
-    train_ds = TensorDataset(torch.from_numpy(X_tr).float(), torch.from_numpy(y_tr).long())
-    val_ds   = TensorDataset(torch.from_numpy(X_va).float(), torch.from_numpy(y_va).long())
-    
-    train_loader = DataLoader(train_ds, batch_size=128, shuffle=True)
-    val_loader   = DataLoader(val_ds,   batch_size=128, shuffle=False)
-    
-    torch.manual_seed(42)
-    model = LSTMBaseline(
-        input_size=input_size, hidden_size=96,
-        bidirectional=bidirectional, dropout=0.25,
-        num_classes=NUM_CLASSES,
-    ).to(device)
-    
-    criterion = nn.CrossEntropyLoss(weight=cw.to(device))
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    
-    best_f1 = 0.0
-    best_state = None
-    patience = 0
-    epochs = 12
-    
-    for epoch in range(1, epochs + 1):
-        model.train()
-        for X, y in train_loader:
-            X, y = X.to(device), y.to(device)
-            optimizer.zero_grad()
-            logits = model(X)
-            loss = criterion(logits, y)
-            if torch.isnan(loss) or torch.isinf(loss):
-                continue
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
-            optimizer.step()
-            
-        model.eval()
-        all_logits, all_y = [], []
-        with torch.no_grad():
-            for X, y in val_loader:
-                X = X.to(device)
-                all_logits.append(model(X).cpu())
-                all_y.append(y)
-        preds = torch.cat(all_logits).argmax(-1).numpy()
-        y_true = torch.cat(all_y).numpy()
-        val_f1 = f1_score(y_true, preds, average="macro", zero_division=0)
-        
-        if val_f1 > best_f1:
-            best_f1 = val_f1
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            patience = 0
-        else:
-            patience += 1
-            if patience >= 4:
-                break
-                
-    model.load_state_dict(best_state)
-    return model
-
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    # Reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     
     print("[Loading data]")
     train = np.load("data/processed/train.npz")
@@ -130,7 +77,6 @@ def main():
     X_va, y_va = val["X"], val["y"]
     X_te, y_te = test["X"], test["y"]
     
-    cw = torch.from_numpy(np.load("data/processed/class_weights.npy")).float()
     noise_levels = [0.0, 0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5]
     results = {"Noise Std": noise_levels}
     
@@ -147,19 +93,36 @@ def main():
     results["DT"] = evaluate_sklearn_model_noise(dt, X_te, y_te, noise_levels)
     
     # 3. LSTM
-    lstm_model = train_lstm("LSTM", X_tr, y_tr, X_va, y_va, False, device, cw)
-    results["LSTM"] = evaluate_torch_model_noise(lstm_model, X_te, y_te, device, noise_levels, is_rlstm=False)
-    
+    print("\n[Evaluating LSTM Baseline]")
+    lstm_ckpt = Path("results/checkpoints/best_lstm.pt")
+    if lstm_ckpt.exists():
+        lstm_model, _ = load_baseline_model(lstm_ckpt, device)
+        results["LSTM"] = evaluate_torch_model_noise(lstm_model, X_te, y_te, device, noise_levels, is_rlstm=False)
+    else:
+        print("[WARNING] best_lstm.pt not found. Skipping LSTM.")
+        results["LSTM"] = [0.0] * len(noise_levels)
+
     # 4. BiLSTM
-    bilstm_model = train_lstm("BiLSTM", X_tr, y_tr, X_va, y_va, True, device, cw)
-    results["BiLSTM"] = evaluate_torch_model_noise(bilstm_model, X_te, y_te, device, noise_levels, is_rlstm=False)
+    print("\n[Evaluating BiLSTM Baseline]")
+    bilstm_ckpt = Path("results/checkpoints/best_bilstm.pt")
+    if bilstm_ckpt.exists():
+        bilstm_model, _ = load_baseline_model(bilstm_ckpt, device)
+        results["BiLSTM"] = evaluate_torch_model_noise(bilstm_model, X_te, y_te, device, noise_levels, is_rlstm=False)
+    else:
+        print("[WARNING] best_bilstm.pt not found. Skipping BiLSTM.")
+        results["BiLSTM"] = [0.0] * len(noise_levels)
     
     # 5. HMR-BiLSTM
     print("\n[Evaluating HMR-BiLSTM]")
-    checkpoint_path = "results/checkpoints/best_rlstm.pt"
-    input_size = X_te.shape[-1] if len(X_te.shape) > 2 else 1
-    rlstm_model, _ = load_rlstm_model(checkpoint_path, device, input_size)
-    results["HMR-BiLSTM"] = evaluate_torch_model_noise(rlstm_model, X_te, y_te, device, noise_levels, is_rlstm=True)
+    # Guard against missing checkpoints
+    rlstm_ckpt = Path("results/checkpoints/best_rlstm.pt")
+    if rlstm_ckpt.exists():
+        input_size = X_te.shape[-1] if len(X_te.shape) > 2 else 1
+        rlstm_model, _ = load_rlstm_model(str(rlstm_ckpt), device, input_size)
+        results["HMR-BiLSTM"] = evaluate_torch_model_noise(rlstm_model, X_te, y_te, device, noise_levels, is_rlstm=True)
+    else:
+        print("[WARNING] best_rlstm.pt not found. Skipping HMR-BiLSTM.")
+        results["HMR-BiLSTM"] = [0.0] * len(noise_levels)
     
     # Print results table
     print("\n" + "="*80)

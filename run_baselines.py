@@ -240,6 +240,13 @@ def train_lstm_baseline(name, train, val, test, bidirectional, device,
     train_time = time.time() - t0
     print(f"  [{name}] best val F1_macro = {best_f1:.4f} (stopped at epoch {epoch})")
 
+    # Save checkpoint
+    checkpoint_dir = Path("results/checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"best_{name.lower()}.pt"
+    torch.save(best_state, checkpoint_path)
+    print(f"  Saved checkpoint: {checkpoint_path}")
+
     # Test evaluation
     model.load_state_dict(best_state)
     model.eval()
@@ -261,6 +268,12 @@ def train_lstm_baseline(name, train, val, test, bidirectional, device,
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+
+    # Reproducibility
+    torch.manual_seed(42)
+    np.random.seed(42)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
     print("\n[Loading data]")
     train_data, val_data, test_data = load_data()
@@ -300,7 +313,7 @@ def main():
           f"AUC: {all_results['bilstm']['auc_ovr']:.4f}")
 
     Path("results").mkdir(exist_ok=True)
-    out_path = Path("results/baseline_results.json")
+    out_path = Path("results/logs/baseline_results.json")
     with open(out_path, "w") as f:
         json.dump(all_results, f, indent=2)
 

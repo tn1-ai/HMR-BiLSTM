@@ -1,10 +1,10 @@
-# preprocess.py (FIXED VERSION)
+# preprocess.py
 
 """
-Tiền xử lý MIT-BIH ECG cho HMR-BiLSTM (PHIÊN BẢN ĐÃ FIX).
+Tiền xử lý MIT-BIH ECG cho HMR-BiLSTM.
 
 Các cải tiến quan trọng:
-1. ECG normalization (CRITICAL FIX)
+1. ECG normalization
 2. Giữ statistics mean/std cho inference
 3. Class weights clipping an toàn hơn
 4. In thống kê normalization
@@ -30,8 +30,9 @@ RANDOM_SEED = 42
 SEQUENCE_LENGTH = 187
 NUM_CLASSES = 5
 
-# Subsample để train nhanh hơn
-SUBSAMPLE_SIZE = 30000
+# Subsample setting — set to None or 0 to use full dataset
+# Set to e.g. 30000 for faster experimentation
+SUBSAMPLE_SIZE = None   # Use full ~87k train samples
 
 CLASS_NAMES = {
     0: "N (Normal)",
@@ -94,7 +95,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 70)
-    print(" PREPROCESS MIT-BIH ECG (FIXED VERSION) ")
+    print(" PREPROCESS MIT-BIH ECG ")
     print("=" * 70)
 
     # =========================================================
@@ -110,29 +111,14 @@ def main():
     print_class_distribution(y_test, "TEST")
 
     # =========================================================
-    # STEP 2: SUBSAMPLE
+    # STEP 2: NORMALIZATION
     # =========================================================
 
-    print(f"\n[2/8] Subsampling train to {SUBSAMPLE_SIZE} samples...")
-
-    X_train_full, y_train_full = stratified_subsample(
-        X_train_full,
-        y_train_full,
-        SUBSAMPLE_SIZE,
-        RANDOM_SEED,
-    )
-
-    print_class_distribution(y_train_full, "TRAIN (after subsample)")
-
-    # =========================================================
-    # STEP 3: NORMALIZATION (CRITICAL FIX)
-    # =========================================================
-
-    print("\n[3/8] Normalizing ECG signals...")
+    print("\n[2/8] Normalizing ECG signals...")
 
     # IMPORTANT:
-    # ECG signals should ALWAYS be normalized before RNN/LSTM.
-    # Otherwise sigmoid/tanh gates saturate easily.
+    # Calculate mean and std on FULL train set BEFORE subsampling
+    # so test set and training set share the same global statistics.
 
     mean = X_train_full.mean()
     std = X_train_full.std() + 1e-8
@@ -140,12 +126,9 @@ def main():
     print(f"  Mean BEFORE normalization: {mean:.6f}")
     print(f"  Std  BEFORE normalization: {std:.6f}")
 
-    # Normalize using TRAIN statistics only
+    # Normalize
     X_train_full = (X_train_full - mean) / std
     X_test = (X_test - mean) / std
-
-    print(f"  Mean AFTER normalization: {X_train_full.mean():.6f}")
-    print(f"  Std  AFTER normalization: {X_train_full.std():.6f}")
 
     # Save normalization statistics
     np.save(
@@ -157,6 +140,23 @@ def main():
         out_dir / "norm_std.npy",
         np.array([std], dtype=np.float32),
     )
+
+    # =========================================================
+    # STEP 3: SUBSAMPLE
+    # =========================================================
+
+    if SUBSAMPLE_SIZE and SUBSAMPLE_SIZE > 0:
+        print(f"\n[3/8] Subsampling train to {SUBSAMPLE_SIZE} samples...")
+        X_train_full, y_train_full = stratified_subsample(
+            X_train_full,
+            y_train_full,
+            SUBSAMPLE_SIZE,
+            RANDOM_SEED,
+        )
+        print_class_distribution(y_train_full, "TRAIN (after subsample)")
+    else:
+        print(f"\n[3/8] Using FULL training set ({len(X_train_full)} samples)")
+        print_class_distribution(y_train_full, "TRAIN (full)")
 
     # =========================================================
     # STEP 4: TRAIN/VAL SPLIT

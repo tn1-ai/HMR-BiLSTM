@@ -42,12 +42,11 @@ def load_rlstm_model(checkpoint_path, device, input_size=1):
         hidden_size=cfg["hidden_size"],
         dropout=cfg["dropout"],
         num_classes=cfg["num_classes"],
+        cnn_out_channels=cfg.get("cnn_out_channels", 64),
+        num_layers=cfg.get("num_layers", 1),
     ).to(device)
-    try:
-        model.load_state_dict(ckpt["model_state"], strict=False)
-    except RuntimeError as e:
-        print(f"[WARNING] Checkpoint incompatible: {e}")
-        print("[WARNING] Using untrained model for inspection only.")
+    # strict=True để phát hiện lỗi ngay
+    model.load_state_dict(ckpt["model_state"], strict=True)
     model.eval()
     return model, ckpt
 
@@ -298,7 +297,7 @@ def main():
 
     print("\n[Aggregating all results]")
     all_results = {}
-    baseline_file = Path("results/baseline_results.json")
+    baseline_file = Path("results/logs/baseline_results.json")
     if baseline_file.exists():
         with open(baseline_file) as f:
             all_results = json.load(f)
@@ -341,7 +340,7 @@ def main():
               f"{m['f1_weighted']:>8.4f} "
               f"{m['auc_ovr']:>8.4f}{marker}")
 
-    csv_path = Path("results/final_results.csv")
+    csv_path = Path("results/tables/final_results.csv")
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["Model", "Accuracy", "Precision_macro", "Recall_macro",

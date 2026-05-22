@@ -1,0 +1,14 @@
+\begin{table}[h!]
+\centering
+\caption{Calibration quality on MIT-BIH test set. Bold = best per column.}
+\label{tab:calibration}
+\begin{tabular}{lrrrr}
+\toprule
+Model & ECE (↓) & Brier Score (↓) & ECE Grade & Brier Grade \\
+\midrule
+LSTM & \textbf{0.0056} & 0.0461 & Excellent & Excellent \\
+BiLSTM & 0.0080 & 0.0542 & Excellent & Good \\
+HMR-BiLSTM & 0.0397 & \textbf{0.0444} & Good & Excellent \\
+\bottomrule
+\end{tabular}
+\end{table}

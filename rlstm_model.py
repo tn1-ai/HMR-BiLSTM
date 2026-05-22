@@ -125,11 +125,12 @@ class RLSTMCell(nn.Module):
                     n = param.size(0) // 4
                     with torch.no_grad():
                         param[n:2*n].fill_(1.0)
-                # CRITICAL: bias của W_beta khởi tạo âm để bắt đầu β ≈ 0
-                # → mô hình bắt đầu như LSTM chuẩn, sau đó học dùng RMC
+                # CRITICAL: bias của W_beta khởi tạo âm để bắt đầu β gần LSTM thuần túy.
+                # -5.0 → sigmoid(-5) ≈ 0.007: RMC path gần tắt hoàn toàn ở epoch 1,
+                # gradient đủ để W_beta dần dần học mở RMC khi cần.
                 if "W_beta.bias" in name:
                     with torch.no_grad():
-                        param.fill_(-1.0)   # sigmoid(-1) ≈ 0.27
+                        param.fill_(-5.0)   # sigmoid(-5) ≈ 0.007
 
     def forward(self, x_t, h_prev, c_prev):
         # === Bước 1: Bốn cổng LSTM chuẩn — Eq. (2)-(5) ===
@@ -146,16 +147,21 @@ class RLSTMCell(nn.Module):
         m_t = Wc_c * Wh_h
 
         # === Bước 3: Residual Gate — Eq. (9) ===
-        linear_part = self.layer_norm(Wc_c + Wh_h)
-        r_t = torch.sigmoid(linear_part + 0.1 * m_t)
+        # Include m_t in LayerNorm to prevent it from dominating r_t
+        combined_rmc = Wc_c + Wh_h + m_t
+        r_t = torch.sigmoid(self.layer_norm(combined_rmc))
 
         # === Bước 4: Memory Decomposition — Eq. (10), (11) ===
         c_keep = (f_t + r_t * (1.0 - f_t)) * c_prev
         c_add  = (1.0 - r_t) * (i_t * g_t)
 
         # === Bước 5a: RMC PATH — softmax attention (Giải pháp 1) ===
-        combined = torch.cat([c_keep, c_add], dim=-1)
-        scores = self.W_alpha(combined)
+        # Normalize c_keep and c_add before concatenation
+        c_keep_norm = F.layer_norm(c_keep, (c_keep.shape[-1],))
+        c_add_norm  = F.layer_norm(c_add,  (c_add.shape[-1],))
+
+        combined_alpha = torch.cat([c_keep_norm, c_add_norm], dim=-1)
+        scores = self.W_alpha(combined_alpha)
         alpha = F.softmax(scores, dim=-1)
         alpha_keep = alpha[:, 0:1]
         alpha_add  = alpha[:, 1:2]
@@ -220,31 +226,61 @@ class RLSTMLayer(nn.Module):
 
 
 # =============================================================================
-#  BIDIRECTIONAL HMR-BiLSTM
+#  BIDIRECTIONAL HMR-BiLSTM (Multi-layer support)
 # =============================================================================
 class BiRLSTM(nn.Module):
-    def __init__(self, input_size, hidden_size, dropout=0.1):
+    """
+    Bidirectional HMR-BiLSTM with optional multi-layer stacking.
+    - num_layers=1: backward-compatible with original single-layer design.
+    - num_layers>1: stacks BiRLSTM layers with inter-layer dropout,
+      analogous to nn.LSTM(num_layers=N).
+    Only the *last* layer's r_t / c_keep / c_add are returned for
+    interpretability (deeper layers capture higher-level patterns).
+    """
+
+    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.1):
         super().__init__()
         self.hidden_size = hidden_size
-        self.forward_layer  = RLSTMLayer(input_size, hidden_size, dropout=dropout)
-        self.backward_layer = RLSTMLayer(input_size, hidden_size, dropout=dropout)
+        self.num_layers = num_layers
+
+        # Build layer stack
+        self.fwd_layers = nn.ModuleList()
+        self.bwd_layers = nn.ModuleList()
+        for i in range(num_layers):
+            layer_in = input_size if i == 0 else 2 * hidden_size
+            self.fwd_layers.append(RLSTMLayer(layer_in, hidden_size, dropout=dropout))
+            self.bwd_layers.append(RLSTMLayer(layer_in, hidden_size, dropout=dropout))
+
+        self.inter_dropout = nn.Dropout(dropout) if num_layers > 1 else None
 
     def forward(self, x):
-        h_fwd, (h_T_fwd, c_T_fwd), r_fwd, ck_fwd, ca_fwd = self.forward_layer(x)
+        h_seq = x  # (B, T, input_size)
 
-        x_reversed = torch.flip(x, dims=[1])
-        h_bwd, (h_T_bwd, c_T_bwd), r_bwd, ck_bwd, ca_bwd = \
-            self.backward_layer(x_reversed)
+        # Process through each stacked layer
+        for i in range(self.num_layers):
+            h_fwd, (h_T_fwd, c_T_fwd), r_fwd, ck_fwd, ca_fwd = \
+                self.fwd_layers[i](h_seq)
 
-        h_bwd  = torch.flip(h_bwd,  dims=[1])
-        r_bwd  = torch.flip(r_bwd,  dims=[1])
-        ck_bwd = torch.flip(ck_bwd, dims=[1])
-        ca_bwd = torch.flip(ca_bwd, dims=[1])
+            x_reversed = torch.flip(h_seq, dims=[1])
+            h_bwd, (h_T_bwd, c_T_bwd), r_bwd, ck_bwd, ca_bwd = \
+                self.bwd_layers[i](x_reversed)
 
-        h_seq = torch.cat([h_fwd, h_bwd], dim=-1)
-        h_T   = torch.cat([h_T_fwd, h_T_bwd], dim=-1)
-        c_T   = torch.cat([c_T_fwd, c_T_bwd], dim=-1)
+            h_bwd  = torch.flip(h_bwd,  dims=[1])
+            r_bwd  = torch.flip(r_bwd,  dims=[1])
+            ck_bwd = torch.flip(ck_bwd, dims=[1])
+            ca_bwd = torch.flip(ca_bwd, dims=[1])
 
+            h_seq = torch.cat([h_fwd, h_bwd], dim=-1)  # (B, T, 2H)
+
+            # Apply dropout between layers (not after last layer)
+            if self.inter_dropout is not None and i < self.num_layers - 1:
+                h_seq = self.inter_dropout(h_seq)
+
+        # Final states from the last layer
+        h_T = torch.cat([h_T_fwd, h_T_bwd], dim=-1)
+        c_T = torch.cat([c_T_fwd, c_T_bwd], dim=-1)
+
+        # Return last layer's internals for interpretability
         return h_seq, (h_T, c_T), r_fwd, r_bwd, ck_fwd, ck_bwd, ca_fwd, ca_bwd
 
 
@@ -259,6 +295,7 @@ class RLSTMClassifier(nn.Module):
         dropout: float = 0.25,
         num_classes: int = 5,
         cnn_out_channels: int = 64,
+        num_layers: int = 1,
     ):
         super().__init__()
         self.cnn = ECGFeatureExtractor(
@@ -266,7 +303,10 @@ class RLSTMClassifier(nn.Module):
             output_channels=cnn_out_channels,
             dropout=dropout * 0.5,
         )
-        self.birlstm = BiRLSTM(cnn_out_channels, hidden_size, dropout=dropout)
+        self.birlstm = BiRLSTM(
+            cnn_out_channels, hidden_size,
+            num_layers=num_layers, dropout=dropout,
+        )
         self.attention_pool = AttentionPooling(2 * hidden_size)
         self.layer_norm = nn.LayerNorm(2 * hidden_size)
         self.dropout = nn.Dropout(dropout)
@@ -313,11 +353,57 @@ def temporal_smoothness_loss(r_seq):
     return squared_norm.mean()
 
 
+class FocalLoss(nn.Module):
+    """Focal Loss for class-imbalanced classification (Lin et al., 2017).
+
+    Reduces loss for well-classified examples and focuses training on hard /
+    minority samples.  Compatible with optional per-class weights (alpha).
+
+    Args:
+        alpha:     Per-class weight tensor (same as nn.CrossEntropyLoss ``weight``).
+        gamma:     Focusing parameter (default 2.0). Higher = more focus on hard.
+        reduction: ``'mean'`` | ``'sum'`` | ``'none'``.
+    """
+
+    def __init__(self, alpha=None, gamma: float = 2.0, reduction: str = "mean"):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, logits, targets):
+        # Compute pt from raw CE (without class_weight)
+        # → focal multiplier (1-pt)^gamma phản ánh đúng độ khó của sample,
+        #   không bị bias bởi class_weight của minority classes (S, F).
+        ce_raw = F.cross_entropy(logits, targets, reduction="none")
+        pt = torch.exp(-ce_raw)  # probability of correct class (unweighted)
+
+        # Áp dụng class_weight vào focal_loss sau khi đã tính multiplier
+        focal_loss = ((1.0 - pt) ** self.gamma) * ce_raw
+        if self.alpha is not None:
+            weight_per_sample = self.alpha[targets]
+            focal_loss = focal_loss * weight_per_sample
+
+        if self.reduction == "mean":
+            return focal_loss.mean()
+        elif self.reduction == "sum":
+            return focal_loss.sum()
+        return focal_loss
+
+
 class RLSTMLoss(nn.Module):
-    def __init__(self, lambda_smooth=0.01, class_weights=None):
+    """Combined loss: task (CE or Focal) + temporal smoothness regularisation."""
+
+    def __init__(self, lambda_smooth=0.01, class_weights=None,
+                 use_focal: bool = False, focal_gamma: float = 2.0):
         super().__init__()
         self.lambda_smooth = lambda_smooth
-        self.task_loss = nn.CrossEntropyLoss(weight=class_weights)
+        if use_focal:
+            self.task_loss = FocalLoss(
+                alpha=class_weights, gamma=focal_gamma
+            )
+        else:
+            self.task_loss = nn.CrossEntropyLoss(weight=class_weights)
 
     def forward(self, logits, targets, r_fwd=None, r_bwd=None):
         l_task = self.task_loss(logits, targets)
@@ -342,17 +428,49 @@ class RLSTMLoss(nn.Module):
 if __name__ == "__main__":
     torch.manual_seed(42)
     B, T, D = 8, 187, 1
+
+    # --- Test 1: Single-layer (backward-compatible) ---
+    print("=" * 50)
+    print("Test 1: Single-layer HMR-BiLSTM (default)")
     model = RLSTMClassifier(input_size=D, hidden_size=96, num_classes=5)
     x = torch.randn(B, T, D)
     y = torch.randint(0, 5, (B,))
     criterion = RLSTMLoss(lambda_smooth=0.003)
 
     logits, internals = model(x, return_internals=True)
-    print(f"[Plan B] Logits shape: {logits.shape}")
-    print(f"[Plan B] r_fwd shape:  {internals['r_fwd'].shape}")
-    print(f"[Plan B] Tổng tham số: {sum(p.numel() for p in model.parameters()):,}")
+    print(f"  Logits shape: {logits.shape}")
+    print(f"  r_fwd shape:  {internals['r_fwd'].shape}")
+    print(f"  Parameters:   {sum(p.numel() for p in model.parameters()):,}")
 
     loss, comp = criterion(logits, y, internals["r_fwd"], internals["r_bwd"])
-    print(f"[Plan B] Loss: {loss.item():.4f}")
+    print(f"  Loss (CE):    {loss.item():.4f}")
     loss.backward()
-    print("[Plan B] ✓ Backward OK")
+    print("  ✓ Backward OK")
+
+    # --- Test 2: Multi-layer (num_layers=2) ---
+    print("\n" + "=" * 50)
+    print("Test 2: Multi-layer HMR-BiLSTM (num_layers=2)")
+    model2 = RLSTMClassifier(
+        input_size=D, hidden_size=96, num_classes=5, num_layers=2
+    )
+    logits2, internals2 = model2(x, return_internals=True)
+    print(f"  Logits shape: {logits2.shape}")
+    print(f"  r_fwd shape:  {internals2['r_fwd'].shape}")
+    print(f"  Parameters:   {sum(p.numel() for p in model2.parameters()):,}")
+    loss2, _ = criterion(logits2, y, internals2["r_fwd"], internals2["r_bwd"])
+    loss2.backward()
+    print("  ✓ Backward OK")
+
+    # --- Test 3: Focal Loss ---
+    print("\n" + "=" * 50)
+    print("Test 3: Focal Loss (gamma=2.0)")
+    criterion_focal = RLSTMLoss(
+        lambda_smooth=0.003, use_focal=True, focal_gamma=2.0
+    )
+    logits3, internals3 = model(x, return_internals=True)
+    loss3, comp3 = criterion_focal(
+        logits3, y, internals3["r_fwd"], internals3["r_bwd"]
+    )
+    print(f"  Focal Loss: {loss3.item():.4f}")
+    loss3.backward()
+    print("  ✓ Backward OK")

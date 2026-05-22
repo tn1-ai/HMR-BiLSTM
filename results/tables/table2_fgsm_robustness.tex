@@ -1,0 +1,14 @@
+\begin{table}[h!]
+\centering
+\caption{FGSM adversarial robustness (epsilon=0.02). ASR = Attack Success Rate.}
+\label{tab:fgsm_robust}
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Model & F1 (clean) & F1 (adv) & F1 drop & ASR & Rec-S clean & Rec-S adv & Rec-V clean & Rec-V adv \\
+\midrule
+BiLSTM & 0.8616 & 0.7732 & 0.0884 & 0.0358 & 0.7698 & 0.7122 & 0.9427 & 0.8971 \\
+HMR-BiLSTM & 0.8825 & \textbf{0.8425} & 0.0400 & 0.0114 & 0.8112 & 0.7842 & 0.9448 & 0.9268 \\
+LSTM & 0.8691 & 0.8189 & 0.0502 & 0.0155 & 0.6727 & 0.6331 & 0.9613 & 0.9330 \\
+\bottomrule
+\end{tabular}
+\end{table}
